@@ -37,10 +37,24 @@ CREATE TABLE IF NOT EXISTS releases (
     version INTEGER PRIMARY KEY, created_at TEXT NOT NULL, manifest TEXT NOT NULL, digest TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS release_entries (
     version INTEGER NOT NULL, source TEXT NOT NULL, indicator TEXT NOT NULL, period TEXT NOT NULL,
-    batch_id INTEGER NOT NULL, line INTEGER NOT NULL, value TEXT NOT NULL, unit TEXT NOT NULL,
+    batch_id INTEGER NOT NULL, line INTEGER NOT NULL, value TEXT, unit TEXT NOT NULL,
     PRIMARY KEY(version, source, indicator, period), FOREIGN KEY(version) REFERENCES releases(version));
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY, at TEXT NOT NULL, kind TEXT NOT NULL, subject TEXT NOT NULL, detail TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS license_decisions (
+    id INTEGER PRIMARY KEY, source TEXT NOT NULL, action TEXT NOT NULL, effective_at TEXT NOT NULL,
+    notification_id TEXT NOT NULL, reason TEXT NOT NULL, indicator TEXT, period TEXT, mode TEXT,
+    recorded_at TEXT NOT NULL,
+    UNIQUE(source, notification_id),
+    FOREIGN KEY(source) REFERENCES sources(key));
+CREATE INDEX IF NOT EXISTS license_decisions_lookup
+    ON license_decisions(source, effective_at, id);
+CREATE TABLE IF NOT EXISTS release_restrictions (
+    version INTEGER NOT NULL, source TEXT NOT NULL, indicator TEXT NOT NULL, period TEXT NOT NULL,
+    mode TEXT NOT NULL, decision_id INTEGER NOT NULL, reason TEXT NOT NULL,
+    PRIMARY KEY(version, source, indicator, period),
+    FOREIGN KEY(version) REFERENCES releases(version),
+    FOREIGN KEY(decision_id) REFERENCES license_decisions(id));
 """
 
 
@@ -129,6 +143,48 @@ class LedgerStore:
                                       (indicator, source_unit)).fetchone()
         return UnitRule(*row) if row else None
 
+    def record_license_decision(self, decision) -> dict[str, Any]:
+        """幂等记录授权决策：相同 (source, notification_id) 的重放不产生新状态。"""
+        with self.transaction():
+            existing = self.connection.execute(
+                "SELECT * FROM license_decisions WHERE source=? AND notification_id=?",
+                (decision.source, decision.notification_id)).fetchone()
+            if existing is not None:
+                return self._license_decision(existing)
+            cursor = self.connection.execute(
+                "INSERT INTO license_decisions(source,action,effective_at,notification_id,reason,"
+                "indicator,period,mode,recorded_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (decision.source, decision.action, decision.effective_at, decision.notification_id,
+                 decision.reason, decision.indicator, decision.period, decision.mode, utc_now()))
+            row = self.connection.execute("SELECT * FROM license_decisions WHERE id=?",
+                                          (cursor.lastrowid,)).fetchone()
+            stored = self._license_decision(row)
+            self.event("license_" + decision.action, f"source:{decision.source}", stored)
+            return stored
+
+    @staticmethod
+    def _license_decision(row: sqlite3.Row) -> dict[str, Any]:
+        return dict(row)
+
+    def get_license_decision(self, decision_id: int) -> dict[str, Any]:
+        row = self.connection.execute("SELECT * FROM license_decisions WHERE id=?",
+                                      (decision_id,)).fetchone()
+        if row is None:
+            raise ContractError("unknown_license_decision", f"license decision {decision_id} does not exist")
+        return self._license_decision(row)
+
+    def list_license_decisions(self, source: str | None = None) -> list[dict[str, Any]]:
+        if source is not None:
+            rows = self.connection.execute(
+                "SELECT * FROM license_decisions WHERE source=? ORDER BY effective_at, id", (source,))
+        else:
+            rows = self.connection.execute("SELECT * FROM license_decisions ORDER BY effective_at, id")
+        return [self._license_decision(row) for row in rows]
+
+    def release_restrictions(self, version: int) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.connection.execute(
+            "SELECT * FROM release_restrictions WHERE version=? ORDER BY source,indicator,period", (version,))]
+
     def latest_batch(self, source: str, external_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("SELECT * FROM batches WHERE source=? AND external_id=? ORDER BY revision DESC LIMIT 1",
                                       (source, external_id)).fetchone()
@@ -153,18 +209,21 @@ class LedgerStore:
             rows = self.connection.execute("SELECT * FROM batches ORDER BY id")
         return [self._batch(row) for row in rows]
 
-    def insert_batch(self, envelope, assessment, measurements) -> dict[str, Any]:
+    def insert_batch(self, envelope, assessment, measurements, license_snapshot=None) -> dict[str, Any]:
         with self.transaction():
             old = self.latest_batch(envelope.source, envelope.batch_id)
             if old and old["payload_hash"] == envelope.payload_hash:
                 return old
             revision = 1 if old is None else old["revision"] + 1
+            metadata = dict(envelope.metadata)
+            if license_snapshot is not None:
+                metadata["license_snapshot"] = license_snapshot
             cursor = self.connection.execute(
                 "INSERT INTO batches(source,external_id,revision,payload_hash,status,row_count,metadata,findings,received_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?)",
                 (envelope.source, envelope.batch_id, revision, envelope.payload_hash,
                  assessment.status, envelope.declared_count,
-                 canonical_bytes(envelope.metadata).decode(),
+                 canonical_bytes(metadata).decode(),
                  canonical_bytes([item.document() for item in assessment.findings]).decode(), utc_now()))
             batch_id = cursor.lastrowid
             self.connection.executemany(
@@ -222,7 +281,8 @@ class LedgerStore:
             "SELECT * FROM release_entries WHERE version=? ORDER BY source,indicator,period", (version,))]
 
     def publish(self, batch_id: int, expected_revision: int, manifest: dict[str, Any],
-                entries: list[dict[str, Any]], digest: str) -> dict[str, Any]:
+                entries: list[dict[str, Any]], digest: str,
+                restrictions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         with self.transaction():
             batch = self.batch(batch_id)
             latest = self.latest_batch(batch["source"], batch["external_id"])
@@ -241,7 +301,14 @@ class LedgerStore:
             self.connection.executemany("INSERT INTO release_entries VALUES(?,?,?,?,?,?,?,?)",
                 [(version, item["source"], item["indicator"], item["period"],
                   item["batch_id"], item["line"], item["value"], item["unit"]) for item in entries])
+            for item in restrictions or []:
+                self.connection.execute(
+                    "INSERT INTO release_restrictions(version,source,indicator,period,mode,decision_id,reason) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (version, item["source"], item["indicator"], item["period"],
+                     item["mode"], item["decision_id"], item["reason"]))
             self.connection.execute("UPDATE batches SET status='published',published_version=? WHERE id=?",
                                     (version, batch_id))
-            self.event("publish", f"batch:{batch_id}", {"version": version, "digest": digest})
+            self.event("publish", f"batch:{batch_id}", {"version": version, "digest": digest,
+                       "restricted": len(restrictions or [])})
             return self.release(version)

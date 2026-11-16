@@ -79,6 +79,20 @@ def parser() -> ArgumentParser:
     receipt = commands.add_parser("receipt")
     receipt.add_argument("kind", choices=("source", "indicator", "batch", "release"))
     receipt.add_argument("key")
+    license_record = commands.add_parser("record-license",
+                                         help="record a revoke/grant decision with an effective time")
+    license_record.add_argument("decision", help="local UTF-8 JSON license decision")
+    license_list = commands.add_parser("license-decisions")
+    license_list.add_argument("--source")
+    license_state = commands.add_parser("license-state")
+    license_state.add_argument("source")
+    license_state.add_argument("--at", help="ISO-8601 moment; defaults to now")
+    restrictions = commands.add_parser("restrictions")
+    restrictions.add_argument("version", type=int)
+    export_licensed = commands.add_parser("export-licensed",
+                                          help="export a release re-applying current license restrictions")
+    export_licensed.add_argument("version", type=int)
+    export_licensed.add_argument("--output", help="write bundle to a local file")
     demo = commands.add_parser("demo")
     demo.add_argument("--workspace", default="fixtures")
     return root
@@ -120,9 +134,23 @@ def demo(workspace: str) -> dict[str, Any]:
         bundle = service.export(release["version"])
         if not service.verify(bundle) or len(bundle["entries"]) != 2:
             raise ContractError("demo_verify", "export could not be verified")
+
+        # 授权生命周期演示：来源撤回一个期间的对外许可（遮蔽模式）。
+        revocation = {"source": "sample_lab", "action": "revoke", "mode": "mask",
+                      "effective_at": "2026-03-01T00:00:00Z",
+                      "notification_id": "demo-revoke-1",
+                      "reason": "provider withdrew open release for 2026-01",
+                      "indicator": "co2_ppm", "period": "2026-01"}
+        decision = service.record_license_decision(revocation)
+        # 相同撤权通知重放必须幂等。
+        replayed = service.record_license_decision(revocation)
+        licensed = service.export_with_current_license(release["version"])
         return {"batch_id": batch["id"], "idempotent": ingested["idempotent"],
                 "release_version": release["version"], "digest": release["digest"],
-                "entries": len(bundle["entries"]), "verified": True}
+                "entries": len(bundle["entries"]), "verified": True,
+                "license_decision_id": decision["id"],
+                "revocation_replay_idempotent": replayed["id"] == decision["id"],
+                "overlay_restrictions": licensed["license_overlay"]["restriction_count"]}
 
 
 def execute(args: Namespace) -> Any:
@@ -153,6 +181,21 @@ def execute(args: Namespace) -> Any:
                 Path(args.output).write_text(json.dumps(bundle, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
                 return {"path": args.output, "digest": bundle["digest"]}
             return bundle
+        if args.command == "export-licensed":
+            bundle = service.export_with_current_license(args.version)
+            if args.output:
+                Path(args.output).write_text(json.dumps(bundle, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
+                return {"path": args.output, "digest": bundle["digest"],
+                        "restriction_count": bundle["license_overlay"]["restriction_count"]}
+            return bundle
+        if args.command == "record-license":
+            return service.record_license_decision(read_json(args.decision))
+        if args.command == "license-decisions":
+            return service.license_decisions(args.source)
+        if args.command == "license-state":
+            return service.license_state(args.source, args.at)
+        if args.command == "restrictions":
+            return service.release_restrictions(args.version)
         if args.command == "verify":
             bundle = read_json(args.bundle)
             return {"verified": service.verify(bundle)}

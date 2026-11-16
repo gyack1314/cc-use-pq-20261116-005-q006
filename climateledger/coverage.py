@@ -77,8 +77,9 @@ class CoverageReporter:
         matrix = self.source_matrix(version, indicator_key)
         disagreements = []
         for row in matrix["periods"]:
+            # 被许可遮蔽的条目 value 为 None，不参与来源间数值分歧比较。
             present = {key: Decimal(value["value"]) for key, value in row["sources"].items()
-                       if value is not None}
+                       if value is not None and value["value"] is not None}
             if len(present) < 2:
                 continue
             minimum, maximum = min(present.values()), max(present.values())

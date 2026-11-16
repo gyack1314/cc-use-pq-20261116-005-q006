@@ -115,11 +115,15 @@ class SeriesWindow:
 
     def statistics(self, indicator_key: str, version: int, *, source: str | None = None) -> dict[str, Any]:
         rows = self.slice(indicator_key, version, source=source)
-        values = [Decimal(row["value"]) for row in rows]
+        # 被许可遮蔽的条目 value 为 None：单独计数，不参与数值统计。
+        visible = [row for row in rows if row["value"] is not None]
+        values = [Decimal(row["value"]) for row in visible]
         if not values:
             return {"count": 0, "minimum": None, "maximum": None, "mean": None,
-                    "first_period": None, "last_period": None}
+                    "first_period": None, "last_period": None,
+                    "masked_count": len(rows)}
         return {"count": len(values), "minimum": str(min(values)), "maximum": str(max(values)),
                 "mean": str(sum(values) / len(values)),
-                "first_period": min(row["period"] for row in rows),
-                "last_period": max(row["period"] for row in rows)}
+                "first_period": min(row["period"] for row in visible),
+                "last_period": max(row["period"] for row in visible),
+                "masked_count": len(rows) - len(values)}

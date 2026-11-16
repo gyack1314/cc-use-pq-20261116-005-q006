@@ -14,6 +14,7 @@ from .audit import AuditInspector
 from .coverage import CoverageReporter, BatchCoverage
 from .replay import ReplayInspector
 from .operations import ReviewQueue, ReceiptCatalog
+from .licensing import LicenseManager
 
 
 class LedgerService:
@@ -22,7 +23,8 @@ class LedgerService:
         self.registry = Registry(self.store)
         self.normalizer = Normalizer(self.registry)
         self.quality = QualityGate(self.registry, self.store)
-        self.releases = ReleaseBuilder(self.store)
+        self.licensing = LicenseManager(self.store, self.registry)
+        self.releases = ReleaseBuilder(self.store, self.licensing)
         self.comparator = Comparator(self.store, self.registry)
         self.windows = SeriesWindow(self.store, self.registry)
         self.audit = AuditInspector(self.store, self.registry, self.releases)
@@ -61,14 +63,27 @@ class LedgerService:
         if previous and previous["payload_hash"] == envelope.payload_hash:
             return {"batch": previous, "idempotent": True}
         source = self.registry.source(envelope.source)
+        # 摄入时快照当时的许可状态：内部留痕不受撤权影响，数据从何而来始终可查。
+        license_snapshot = self.licensing.snapshot(source.key)
         if not source.active:
             raise ContractError("inactive_source", f"source {source.key} is inactive")
         measurements, rejected = self.normalizer.batch(source, envelope.rows)
         assessment = self.quality.assess(source.key, measurements, rejected)
-        batch = self.store.insert_batch(envelope, assessment, measurements)
-        return {"batch": batch, "idempotent": False}
+        batch = self.store.insert_batch(envelope, assessment, measurements, license_snapshot)
+        withheld = self.licensing.blocks_approval(source.key,
+                                                  [item.document() for item in measurements])
+        return {"batch": batch, "idempotent": False,
+                "license_snapshot": license_snapshot, "license_withheld": withheld}
 
     def approve(self, batch_id: int, expected_revision: int) -> dict[str, Any]:
+        batch = self.store.batch(batch_id)
+        measurements = self.store.measurements(batch_id)
+        withheld = self.licensing.blocks_approval(batch["source"], measurements)
+        if withheld:
+            scopes = ", ".join(f"{item['indicator']}/{item['period']}" for item in withheld)
+            raise ContractError(
+                "license_withheld",
+                f"batch {batch_id} contains stopped observations that cannot be approved: {scopes}")
         return self.store.approve(batch_id, expected_revision)
 
     def preview(self, batch_id: int, expected_revision: int) -> dict[str, Any]:
@@ -80,8 +95,25 @@ class LedgerService:
     def export(self, version: int) -> dict[str, Any]:
         return self.releases.export(version)
 
+    def export_with_current_license(self, version: int) -> dict[str, Any]:
+        return self.releases.export_with_current_license(version)
+
     def verify(self, bundle: dict[str, Any]) -> bool:
+        if isinstance(bundle.get("license_overlay"), dict):
+            return self.releases.verify_overlay(bundle)
         return self.releases.verify(bundle)
+
+    def record_license_decision(self, decision: dict[str, Any]) -> dict[str, Any]:
+        return self.licensing.record(decision)
+
+    def license_decisions(self, source: str | None = None) -> list[dict[str, Any]]:
+        return self.licensing.decisions(source)
+
+    def license_state(self, source: str, at: str | None = None) -> dict[str, Any]:
+        return self.licensing.state_at(source, at)
+
+    def release_restrictions(self, version: int) -> list[dict[str, Any]]:
+        return self.store.release_restrictions(version)
 
     def lineage(self, version: int) -> list[dict[str, Any]]:
         return self.releases.lineage(version)
